@@ -1,9 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { LeftSidebar } from './components/LeftSidebar';
 import { CenterCanvas } from './components/CenterCanvas';
 import { RightPanel } from './components/RightPanel';
 import { AddAgentModal } from './components/AddAgentModal';
 import { SettingsPanel } from './components/SettingsPanel';
+import { useAICompanyData } from './hooks/useAICompanyData';
+import { routeCommand, dispatchCommandAsTask, buildAutoReply } from './hooks/useCommandDispatch';
 
 export type AgentStatus = 'working' | 'idle' | 'alarm' | 'ceo-calling';
 
@@ -14,6 +16,11 @@ export type Agent = {
   task: string;
   status: AgentStatus;
   avatar: string;
+  _meta?: {
+    modelName: string;
+    providerName: string;
+    taskCount: number;
+  };
 };
 
 export type Message = {
@@ -40,18 +47,12 @@ export type Settings = {
   showLiveFeed: boolean;
   animateConnections: boolean;
   showTaskSnippets: boolean;
+  apiUrl: string;
 };
 
-const DEFAULT_AGENTS: Agent[] = [
-  { id: 'agent-lead', name: 'AGENT-LEAD', role: 'Technical Lead', task: 'Reviewing architecture plan', status: 'working', avatar: 'AL' },
-  { id: 'agent-backend', name: 'AGENT-BACKEND', role: 'Backend Engineer', task: 'Designing database schema', status: 'working', avatar: 'AB' },
-  { id: 'agent-frontend', name: 'AGENT-FRONTEND', role: 'Frontend Engineer', task: 'Building React component tree', status: 'working', avatar: 'AF' },
-  { id: 'agent-qa', name: 'AGENT-QA', role: 'QA Engineer', task: 'Writing test coverage plan', status: 'working', avatar: 'AQ' },
-];
-
 export default function App() {
-  const [agents, setAgents] = useState<Agent[]>(DEFAULT_AGENTS);
-  const [selectedAgentId, setSelectedAgentId] = useState<string>(DEFAULT_AGENTS[0].id);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [selectedAgentId, setSelectedAgentId] = useState<string>('');
   const [messagesByAgent, setMessagesByAgent] = useState<Record<string, Message[]>>({});
   const [activityLog, setActivityLog] = useState<ActivityLog[]>([]);
   const [isPaused, setIsPaused] = useState(false);
@@ -68,127 +69,151 @@ export default function App() {
     showLiveFeed: true,
     animateConnections: true,
     showTaskSnippets: true,
+    apiUrl: import.meta.env.VITE_API_URL ?? 'http://localhost:3000',
   });
 
-  // Update current time every second
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setCurrentTime(new Date());
-    }, 1000);
-    return () => clearInterval(interval);
+  // ─── Callbacks for data hook ───────────────────────────────────────────────
+  const handleAgentsLoaded = useCallback((loaded: Agent[]) => {
+    setAgents(prev => {
+      // Preserve local status overrides (alarm / ceo-calling) during poll updates
+      return loaded.map(incoming => {
+        const existing = prev.find(p => p.id === incoming.id);
+        if (existing && (existing.status === 'alarm' || existing.status === 'ceo-calling')) {
+          return { ...incoming, status: existing.status };
+        }
+        return incoming;
+      });
+    });
+    setSelectedAgentId(prev => prev || loaded[0]?.id || '');
   }, []);
 
-  // Add activity log entries every 4 seconds when not paused
+  const handleActivityAppend = useCallback((log: ActivityLog) => {
+    setActivityLog(prev => [...prev.slice(-20), log]);
+  }, []);
+
+  // ─── Live data from AICOMPANY API ──────────────────────────────────────────
+  const { loading, error, stats, providers, models } = useAICompanyData({
+    isPaused,
+    onAgentsLoaded: handleAgentsLoaded,
+    onActivityAppend: handleActivityAppend,
+  });
+
+  // ─── Clock ─────────────────────────────────────────────────────────────────
   useEffect(() => {
-    if (isPaused) return;
+    const id = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
+  // ─── Local activity simulation when paused / no live tasks ─────────────────
+  useEffect(() => {
+    if (isPaused || agents.length === 0) return;
     const actions = ['Ran command', 'Read file', 'Found files', 'Wrote file', 'Executed task', 'Updated schema'];
-
-    const interval = setInterval(() => {
-      const randomAgent = agents[Math.floor(Math.random() * agents.length)];
-      const randomAction = actions[Math.floor(Math.random() * actions.length)];
-
+    const id = setInterval(() => {
+      const a = agents[Math.floor(Math.random() * agents.length)];
+      if (a.status !== 'working') return;
       setActivityLog(prev => [
         ...prev.slice(-20),
-        {
-          id: `activity-${Date.now()}`,
-          timestamp: new Date(),
-          agentName: randomAgent.name,
-          action: randomAction,
-        },
+        { id: `sim-${Date.now()}`, timestamp: new Date(), agentName: a.name, action: actions[Math.floor(Math.random() * actions.length)] },
       ]);
     }, 4000);
-
-    return () => clearInterval(interval);
+    return () => clearInterval(id);
   }, [isPaused, agents]);
 
-  const handleSendMessage = (text: string, agentId: string) => {
+  // ─── Send message / command ────────────────────────────────────────────────
+  const handleSendMessage = async (text: string, agentId: string) => {
     const isQuestion = text.trim().endsWith('?');
+    const ceoMsg: Message = { id: `msg-${Date.now()}`, sender: 'ceo', text, timestamp: new Date() };
 
-    // Add CEO message
-    const ceoMessage: Message = {
-      id: `msg-${Date.now()}`,
-      sender: 'ceo',
-      text,
-      timestamp: new Date(),
-    };
+    setMessagesByAgent(prev => ({ ...prev, [agentId]: [...(prev[agentId] || []), ceoMsg] }));
 
-    setMessagesByAgent(prev => ({
-      ...prev,
-      [agentId]: [...(prev[agentId] || []), ceoMessage],
-    }));
-
-    // Update agent status
     if (isQuestion && settings.enableAlarms) {
-      // Question: set alarm status
-      setAgents(prev => prev.map(a =>
-        a.id === agentId ? { ...a, status: 'alarm' } : a
-      ));
-
-      // Auto-reply after delay and clear alarm
+      setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'alarm' } : a));
       setTimeout(() => {
-        const agentReply: Message = {
-          id: `msg-${Date.now()}-reply`,
+        const reply: Message = {
+          id: `reply-${Date.now()}`,
           sender: 'agent',
-          text: `I've analyzed the question. Here's my assessment: ${text.slice(0, 30)}... Working on a detailed response now.`,
+          text: `Analyzing: "${text.slice(0, 40)}..." — Working on a detailed response.`,
           timestamp: new Date(),
         };
-
-        setMessagesByAgent(prev => ({
-          ...prev,
-          [agentId]: [...(prev[agentId] || []), agentReply],
-        }));
-
-        if (settings.autoClearAlarms) {
-          setAgents(prev => prev.map(a =>
-            a.id === agentId ? { ...a, status: 'working' } : a
-          ));
-        }
+        setMessagesByAgent(prev => ({ ...prev, [agentId]: [...(prev[agentId] || []), reply] }));
+        if (settings.autoClearAlarms)
+          setAgents(prev => prev.map(a => a.id === agentId ? { ...a, status: 'working' } : a));
       }, settings.autoReplyDelay * 1000);
     } else {
-      // Directive: set CEO calling status briefly
-      setAgents(prev => prev.map(a =>
-        a.id === agentId ? { ...a, status: 'ceo-calling' } : a
-      ));
-
-      // Auto-reply after 2 seconds
-      setTimeout(() => {
-        const agentReply: Message = {
-          id: `msg-${Date.now()}-reply`,
-          sender: 'agent',
-          text: 'Acknowledged. Processing directive now.',
-          timestamp: new Date(),
-        };
-
-        setMessagesByAgent(prev => ({
-          ...prev,
-          [agentId]: [...(prev[agentId] || []), agentReply],
-        }));
-
-        // Return to working status
-        setAgents(prev => prev.map(a =>
-          a.id === agentId ? { ...a, status: 'working' } : a
-        ));
-      }, 2000);
+      // Route as a real task to AICOMPANY
+      const targetAgent = routeCommand(text, agents);
+      const actualTarget = targetAgent ?? agents.find(a => a.id === agentId);
+      if (actualTarget) {
+        setAgents(prev => prev.map(a => a.id === actualTarget.id ? { ...a, status: 'ceo-calling' } : a));
+        try {
+          const task = await dispatchCommandAsTask(text, actualTarget);
+          const autoReply = buildAutoReply(text, actualTarget, task);
+          setMessagesByAgent(prev => ({ ...prev, [actualTarget.id]: [...(prev[actualTarget.id] || []), autoReply] }));
+          setActivityLog(prev => [...prev.slice(-20), {
+            id: `cmd-${Date.now()}`,
+            timestamp: new Date(),
+            agentName: actualTarget.name,
+            action: `Task created: ${text.slice(0, 40)}`,
+          }]);
+        } catch (err) {
+          // If API fails, still show fallback reply
+          const fallback: Message = {
+            id: `fallback-${Date.now()}`,
+            sender: 'agent',
+            text: 'Acknowledged. Processing directive now.',
+            timestamp: new Date(),
+          };
+          setMessagesByAgent(prev => ({ ...prev, [actualTarget.id]: [...(prev[actualTarget.id] || []), fallback] }));
+        }
+        setTimeout(() => {
+          setAgents(prev => prev.map(a => a.id === actualTarget.id ? { ...a, status: 'working' } : a));
+        }, 2000);
+      }
     }
   };
 
-  const handleAddAgent = (agent: Omit<Agent, 'id'>) => {
-    const newAgent: Agent = {
-      ...agent,
-      id: `agent-${Date.now()}`,
-    };
+  // ─── Add agent ─────────────────────────────────────────────────────────────
+  const handleAddAgent = (agentData: Omit<Agent, 'id'>) => {
+    // Optimistically add to local state; real creation handled by AddAgentModal
+    const newAgent: Agent = { ...agentData, id: `local-${Date.now()}` };
     setAgents(prev => [...prev, newAgent]);
     setIsAddAgentModalOpen(false);
   };
 
   const handleResetAgents = () => {
-    setAgents(DEFAULT_AGENTS);
+    setAgents([]);
     setMessagesByAgent({});
-    setSelectedAgentId(DEFAULT_AGENTS[0].id);
+    setSelectedAgentId('');
   };
 
   const selectedAgent = agents.find(a => a.id === selectedAgentId);
+
+  // ─── Loading / error states ─────────────────────────────────────────────────
+  if (loading && agents.length === 0) {
+    return (
+      <div className="size-full flex items-center justify-center" style={{ background: '#0d0f12' }}>
+        <div className="text-center">
+          <div className="text-sm font-mono mb-2" style={{ color: '#00c9a7' }}>CONNECTING TO AICOMPANY API...</div>
+          <div className="text-xs" style={{ color: '#6b7280' }}>{settings.apiUrl}</div>
+        </div>
+      </div>
+    );
+  }
+
+  if (error && agents.length === 0) {
+    return (
+      <div className="size-full flex items-center justify-center" style={{ background: '#0d0f12' }}>
+        <div className="text-center max-w-sm">
+          <div className="text-sm font-mono mb-2" style={{ color: '#ef4444' }}>API CONNECTION FAILED</div>
+          <div className="text-xs mb-4" style={{ color: '#6b7280' }}>{error}</div>
+          <div className="text-xs p-3 rounded font-mono" style={{ background: '#161a1f', color: '#6b7280' }}>
+            Set VITE_API_URL in .env<br />
+            Default: http://localhost:3000
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="size-full flex overflow-hidden" style={{ background: '#0d0f12' }}>
@@ -201,6 +226,7 @@ export default function App() {
         onOpenAddAgent={() => setIsAddAgentModalOpen(true)}
         onOpenSettings={() => setIsSettingsPanelOpen(true)}
         settings={settings}
+        stats={stats}
       />
 
       <CenterCanvas
@@ -226,6 +252,8 @@ export default function App() {
         <AddAgentModal
           onClose={() => setIsAddAgentModalOpen(false)}
           onAdd={handleAddAgent}
+          providers={providers}
+          models={models}
         />
       )}
 
